@@ -5,12 +5,29 @@ Tự khởi động sink server trong background thread (không cần mở tab r
 """
 from __future__ import annotations
 
+import shutil
 import socket
+import tempfile
 import time
+from pathlib import Path
 
 import pytest
 
 from sink.sink import create_server, reset_log
+
+
+@pytest.fixture
+def tmp_path():
+    """Per-test temp directory that is never shared across Windows identities.
+
+    The standard pytest base directory is reused between runs.  In IDE/Codex
+    environments those runs may use different Windows security identities,
+    leaving a directory the next process cannot remove.  A fresh OS-assigned
+    directory avoids that cross-identity ACL collision.
+    """
+    path = Path(tempfile.mkdtemp(prefix="lab24-pytest-"))
+    yield path
+    shutil.rmtree(path, ignore_errors=True)
 
 
 def _wait_port(port: int, timeout: float = 2.0) -> None:

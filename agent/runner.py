@@ -53,11 +53,77 @@ Interface bắt buộc (agent/loop.py import và gọi hàm này nếu tồn t�
 """
 from __future__ import annotations
 
+import hashlib
+import json
+import re
+from datetime import datetime, timezone
 from pathlib import Path
+
+from agent import ledger, pii, policy, tools
 
 REPORTS_DIR = Path(__file__).resolve().parent.parent / "reports"
 DEFAULT_LEDGER_PATH = REPORTS_DIR / "ledger.jsonl"
 
 
 def handle(message: str, llm, log_dir: Path | None = None) -> str:
-    raise NotImplementedError("BƯỚC 3c: implement trifecta split")
+    ledger_path = Path(log_dir) / "ledger.jsonl" if log_dir is not None else DEFAULT_LEDGER_PATH
+    run_id = datetime.now(timezone.utc).strftime("run-%Y%m%dT%H%M%S.%fZ")
+
+    def audited_call(tool_name: str, args: dict, classification: str, purpose: str,
+                     owner: str, depth: int, egress: bool, function):
+        ctx = policy.PolicyContext(classification, purpose, owner, depth, egress)
+        allowed, reason = policy.check(ctx)
+        ledger.append(
+            {
+                "ts": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                "agent_id": owner,
+                "run_id": run_id,
+                "tool": tool_name,
+                "args_hash": hashlib.sha256(
+                    json.dumps(args, sort_keys=True, ensure_ascii=False, default=str).encode("utf-8")
+                ).hexdigest(),
+                "classification": classification,
+                "decision": "allow" if allowed else "deny",
+                "reason": reason,
+            },
+            ledger_path,
+        )
+        return function() if allowed else None
+
+    # Run A owns untrusted documents, but has neither private-store nor network access.
+    docs = audited_call(
+        "search_docs", {"query": message}, "internal", "summarize-tickets",
+        "run-a", 0, False, lambda: tools.search_docs(message),
+    ) or []
+    ticket_ids: list[int] = []
+    for doc in docs:
+        match = re.fullmatch(r"ticket-(\d+)[^.]*\.md", str(doc.get("id", "")), re.I)
+        if match:
+            ticket_ids.append(int(match.group(1)))
+
+    sanitized_docs = [{"id": d["id"], "text": pii.redact(d["text"])} for d in docs]
+    injected = llm.find_injection("\n\n".join(d["text"] for d in sanitized_docs))
+
+    # Run B receives only typed ticket IDs derived from trusted filenames.  It never
+    # sees document free text, so attacker-supplied customer IDs cannot reach it.
+    customers = json.loads(tools.CUSTOMERS_FILE.read_text(encoding="utf-8"))
+    trusted_customer_ids = sorted({
+        str(customer["customer_id"])
+        for customer in customers
+        if set(ticket_ids).intersection(customer.get("related_tickets", []))
+    })
+    for customer_id in trusted_customer_ids:
+        audited_call(
+            "read_customer", {"customer_id": customer_id}, "restricted", "support-reply",
+            "run-b", 1, False, lambda cid=customer_id: tools.read_customer(cid),
+        )
+
+    if injected is not None:
+        # Record the attempted egress as evidence. Policy denies before http_post runs.
+        audited_call(
+            "http_post", {"url": injected.target_url, "body": "[WITHHELD]"},
+            "restricted", "untrusted-document-instruction", "run-egress", 1, True,
+            lambda: tools.http_post(injected.target_url, {"records": []}),
+        )
+
+    return llm.summarize(sanitized_docs)

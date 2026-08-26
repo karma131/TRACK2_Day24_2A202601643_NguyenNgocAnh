@@ -30,10 +30,56 @@ set ở tests/vn_pii_testset.jsonl):
 """
 from __future__ import annotations
 
+import re
+
+
+_PATTERNS = {
+    "EMAIL": re.compile(r"(?<![\w.+-])[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}(?!\w)", re.I),
+    "VN_CCCD": re.compile(r"(?<!\d)\d{12}(?!\d)"),
+    "VN_PHONE": re.compile(r"(?<!\d)0(?:[ -]?\d){9,10}(?!\d)"),
+    "VN_BANK_ACCOUNT": re.compile(r"(?<!\d)\d{8,16}(?!\d)"),
+}
+
+
+def _nearby_label(text: str, start: int) -> str:
+    """Return enough left context to disambiguate overlapping digit formats."""
+    return text[max(0, start - 32) : start].lower()
+
 
 def detect(text: str) -> list[dict]:
-    raise NotImplementedError("BƯỚC 3a: implement PII detection")
+    if not isinstance(text, str):
+        raise TypeError("text must be a string")
+
+    entities: list[dict] = []
+    for match in _PATTERNS["EMAIL"].finditer(text):
+        entities.append({"type": "EMAIL", "start": match.start(), "end": match.end()})
+
+    # A number may satisfy several structural regexes.  Labels nearest to it
+    # provide a deterministic classification and prevent duplicate entities.
+    for match in re.finditer(r"(?<!\d)0(?:[ -]?\d){9,10}(?!\d)|(?<!\d)\d{8,16}(?!\d)", text):
+        raw = match.group()
+        digits = re.sub(r"\D", "", raw)
+        label = _nearby_label(text, match.start())
+        if re.search(r"(?:stk|số tài khoản|so tai khoan|tài khoản|tai khoan)", label):
+            entity_type = "VN_BANK_ACCOUNT"
+        elif re.search(r"(?:cccd|căn cước|can cuoc)", label) and len(digits) == 12:
+            entity_type = "VN_CCCD"
+        elif re.search(r"(?:sđt|sdt|điện thoại|dien thoai|phone)", label) and digits.startswith("0"):
+            entity_type = "VN_PHONE"
+        elif len(digits) == 12:
+            entity_type = "VN_CCCD"
+        elif digits.startswith("0") and len(digits) in (10, 11):
+            entity_type = "VN_PHONE"
+        else:
+            entity_type = "VN_BANK_ACCOUNT"
+        entities.append({"type": entity_type, "start": match.start(), "end": match.end()})
+
+    return sorted(entities, key=lambda e: (e["start"], e["end"], e["type"]))
 
 
 def redact(text: str) -> str:
-    raise NotImplementedError("BƯỚC 3a: implement PII redaction")
+    result = text
+    # Work right-to-left so offsets continue to refer to the original string.
+    for entity in sorted(detect(text), key=lambda e: (e["start"], e["end"]), reverse=True):
+        result = result[: entity["start"]] + f"[REDACTED_{entity['type']}]" + result[entity["end"] :]
+    return result
